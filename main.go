@@ -5,7 +5,23 @@ import (
     "net/http"
 )
 
+type apiConfig struct {
+    fileserverHits int
+}
+
+func (conf *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+        conf.fileserverHits ++
+        next.ServeHTTP(resp, req)
+    })
+}
+
+func (conf *apiConfig) reset() {
+    conf.fileserverHits = 0
+}
+
 func main() {
+    cfg := apiConfig{}
 
     serveMux := http.NewServeMux()
 
@@ -15,8 +31,20 @@ func main() {
         resp.Write([]byte("OK"))
     })
 
-    serveMux.Handle("/", http.StripPrefix("/app", http.FileServer(http.Dir("."))))
-    serveMux.Handle("/assets", http.StripPrefix("/app", http.FileServer(http.Dir("./assets"))))
+    serveMux.HandleFunc("/metrics", func(resp http.ResponseWriter, req *http.Request) {
+        resp.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
+        resp.WriteHeader(200)
+        resp.Write([]byte(fmt.Sprintf("Hits: %d", cfg.fileserverHits)))
+    })
+
+    serveMux.HandleFunc("/reset", func(resp http.ResponseWriter, req *http.Request) {
+        cfg.reset()
+        resp.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
+        resp.WriteHeader(200)
+        resp.Write([]byte("OK"))
+    })
+
+    serveMux.Handle("/*", http.StripPrefix("/app", cfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 
     server := http.Server{ 
         Addr: "0.0.0.0:8080",
