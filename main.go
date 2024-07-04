@@ -14,6 +14,7 @@ func main() {
     //})
 
     serveMux.Handle("/", http.FileServer(http.Dir(".")))
+    serveMux.Handle("/assets", http.FileServer(http.Dir("./assets")))
 
     server := http.Server{ 
         Addr: "0.0.0.0:8080",
