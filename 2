@@ -3,8 +3,6 @@ package main
 import (
     "fmt"
     "net/http"
-    "encoding/json"
-    "strings"
 )
 
 type apiConfig struct {
@@ -28,80 +26,24 @@ func validateChirp(resp http.ResponseWriter, req *http.Request) {
     }
 
     type returnVals struct {
-        Error string `json:"error"`
-        Valid bool `json:"valid"`
-        CleanedBody string `json:"cleaned_body"`
+        Error string `json:"error"`,
+        Valid bool `json:"valid"`,
     }
 
-    decoder := json.NewDecoder(req.Body)
+    decoder := json.NewDecoder(r.Body)
     params := parameters{}
-    err := decoder.Decode(&params)
+    err := decoder.Decoder(&params)
     if err != nil {
         respBody := returnVals{
-            Error: "Error decoding json",
+            error: "Error marshalling json"
         }
-
-        dat, err := json.Marshal(respBody)
-        if err != nil {
-            return
-        }
-        resp.Header().Set("Content-Type", "application/json") 
-        resp.WriteHeader(500)
-        resp.Write(dat)
+        w.WriteHeader(500)
         return
     }
 
-    respBody := returnVals{}
+    if len(params.Body) > 140 {
 
-    respBody.Valid = len(params.Body) <= 140
-    status := 200
-    if !respBody.Valid {
-        status = 400
     }
-
-    purified := purify(params.Body)
-    
-    if (purified != params.Body) {
-        respBody.CleanedBody = purified
-    }
-
-    resp.WriteHeader(status)
-
-    dat, err := json.Marshal(respBody)
-    if err != nil {
-        return
-    }
-    
-    resp.Header().Set("Content-Type", "application/json") 
-    resp.Write(dat)
-}
-
-func purify(ch string) string {
-    badWords := []string {
-        "kerfuffle",
-        "sharbert",
-        "fornax",
-    }
-    
-    words := strings.Split(ch, " ")
-    newWords := []string {}
-    
-    for _, word := range words {
-        isBad := false
-        for _, badWord := range badWords {
-            if badWord == word || strings.ToLower(word) == badWord {
-                isBad = true
-                break
-            }
-        }
-        if isBad {
-            newWords = append(newWords, "****")
-        } else {
-            newWords = append(newWords, word)
-        }
-    }
-
-    return strings.Join(newWords, " ")
 }
 
 func main() {
@@ -139,7 +81,18 @@ func main() {
         `, cfg.fileserverHits)))
     })
 
-    serveMux.HandleFunc("POST /api/validate_chirp", validateChirp)
+    serveMux.HandleFunc("POST /api/validate_chirp", func(resp http.ResponseWriter, req *http.Request) {
+        resp.Header()["Content-Type"] = []string{"text/html"}
+        resp.WriteHeader(200)
+        resp.Write([]byte(fmt.Sprintf(`
+            <html>
+                <body>
+                    <h1>Welcome, Chirpy Admin</h1>
+                    <p>Chirpy has been visited %d times!</p>
+                </body>
+            </html>
+        `, cfg.fileserverHits)))
+    })
 
     serveMux.Handle("/*", http.StripPrefix("/app", cfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 
