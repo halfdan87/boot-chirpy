@@ -5,6 +5,7 @@ import (
     "net/http"
     "encoding/json"
     "strings"
+    "os"
 )
 
 type apiConfig struct {
@@ -22,7 +23,29 @@ func (conf *apiConfig) reset() {
     conf.fileserverHits = 0
 }
 
-func validateChirp(resp http.ResponseWriter, req *http.Request) {
+var currentChirpId int = 1 
+
+type Chirp struct {
+    Id int `json:"id"`
+    Text string `json:"body"`
+}
+
+var db []Chirp = nil
+
+func handleGet(resp http.ResponseWriter, req *http.Request) {
+    initDb()
+    
+    dat, err := json.Marshal(db)
+    if err != nil {
+        return
+    }
+
+    resp.WriteHeader(200)
+    resp.Header().Set("Content-Type", "application/json") 
+    resp.Write(dat)
+}
+
+func handlePost(resp http.ResponseWriter, req *http.Request) {
     type parameters struct {
         Body string `json:"body"`
     }
@@ -51,29 +74,72 @@ func validateChirp(resp http.ResponseWriter, req *http.Request) {
         return
     }
 
-    respBody := returnVals{}
-
-    respBody.Valid = len(params.Body) <= 140
-    status := 200
-    if !respBody.Valid {
+    status := 201
+    if len(params.Body) > 140 {
         status = 400
     }
 
-    purified := purify(params.Body)
-    
-    if (purified != params.Body) {
-        respBody.CleanedBody = purified
+    chirp := Chirp{
+        Text: params.Body,
+        Id: currentChirpId,
     }
 
-    resp.WriteHeader(status)
-
-    dat, err := json.Marshal(respBody)
+    dat, err := json.Marshal(chirp)
     if err != nil {
         return
     }
     
+    purified := purify(params.Body)
+    
+    chirp.Text= purified
+
+    resp.WriteHeader(status)
     resp.Header().Set("Content-Type", "application/json") 
     resp.Write(dat)
+
+    // Save file
+    currentChirpId++
+
+    initDb()
+    db = append(db, chirp)
+    saveDb()
+}
+
+func initDb() {
+    if db != nil {
+        return
+    }
+
+    db := []Chirp{}
+
+    file, err := os.Create("database.json")
+    if err != nil {
+        return
+    }
+    defer file.Close()
+
+    decoder := json.NewDecoder(file)
+    err = decoder.Decode(&db)
+    
+    if err != nil {
+        fmt.Println("Error ", err)
+        return
+    }
+}
+
+func saveDb() {
+    file, err := os.Create("database.json")
+    if err != nil {
+        return
+    }
+    defer file.Close()
+
+    encoder := json.NewEncoder(file)
+    err = encoder.Encode(&db)
+    if err != nil {
+        fmt.Println("Error ", err)
+        return
+    }
 }
 
 func purify(ch string) string {
@@ -139,7 +205,8 @@ func main() {
         `, cfg.fileserverHits)))
     })
 
-    serveMux.HandleFunc("POST /api/validate_chirp", validateChirp)
+    serveMux.HandleFunc("POST /api/chirps", handlePost)
+    serveMux.HandleFunc("GET /api/chirps", handleGet)
 
     serveMux.Handle("/*", http.StripPrefix("/app", cfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 
