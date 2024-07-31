@@ -37,8 +37,9 @@ var currentChirpId int = 1
 var currentUserId int = 1
 
 type Chirp struct {
-	Id   int    `json:"id"`
-	Text string `json:"body"`
+	Id       int    `json:"id"`
+	Text     string `json:"body"`
+	AuthorId int    `json:"author_id"`
 }
 
 type User struct {
@@ -110,6 +111,20 @@ func handleGet(resp http.ResponseWriter, req *http.Request) {
 	resp.Write(dat)
 }
 
+func deleteChirp(chirpId int, owner User) bool {
+	for i := range len(db) {
+		c := db[i]
+		if c.Id == chirpId {
+			if owner.Id != c.AuthorId {
+				return false
+			}
+			db = append(db[:i], db[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 func handleGetWithParams(resp http.ResponseWriter, req *http.Request) {
 	initDb()
 
@@ -133,7 +148,8 @@ func handleGetWithParams(resp http.ResponseWriter, req *http.Request) {
 
 func handlePostChirp(resp http.ResponseWriter, req *http.Request) {
 	type parameters struct {
-		Body string `json:"body"`
+		AuthorId int    `json:"author_id"`
+		Body     string `json:"body"`
 	}
 
 	type returnVals struct {
@@ -142,9 +158,71 @@ func handlePostChirp(resp http.ResponseWriter, req *http.Request) {
 		CleanedBody string `json:"cleaned_body"`
 	}
 
+	jwtHeader := req.Header.Get("Authorization")
+	if jwtHeader == "" {
+		fmt.Println("Authorization header is not provided")
+		resp.WriteHeader(401)
+		return
+	}
+
+	jwtSecret := os.Getenv("JWT_SECRET")
+	jwtHeader = strings.TrimPrefix(jwtHeader, "Bearer ")
+
+	token, err := jwt.ParseWithClaims(jwtHeader, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(jwtSecret), nil
+	})
+
+	fmt.Println(jwtHeader)
+
+	if err != nil {
+		fmt.Printf("Could not parse token: %v %v\n", err, jwtHeader)
+		resp.WriteHeader(401)
+		return
+	}
+
+	claims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok || !token.Valid {
+		fmt.Println("Invalid token")
+		resp.WriteHeader(401)
+		return
+	}
+
+	if claims.ExpiresAt != nil && !claims.ExpiresAt.After(time.Now()) {
+		fmt.Println("Expired token")
+		resp.WriteHeader(401)
+		return
+	}
+
+	userId := claims.Subject
+	id, err := strconv.Atoi(userId)
+	if err != nil {
+		fmt.Println("Invalid user ID in token:", userId)
+		resp.WriteHeader(401)
+		return
+	}
+
+	user := findUserById(id)
+	if user == (User{}) {
+		respBody := returnVals{
+			Error: "User does not exist",
+		}
+
+		dat, err := json.Marshal(respBody)
+		if err != nil {
+			return
+		}
+		resp.Header().Set("Content-Type", "application/json")
+		resp.WriteHeader(500)
+		resp.Write(dat)
+		return
+	}
+
 	decoder := json.NewDecoder(req.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		respBody := returnVals{
 			Error: "Error decoding json",
@@ -166,8 +244,9 @@ func handlePostChirp(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	chirp := Chirp{
-		Text: params.Body,
-		Id:   currentChirpId,
+		AuthorId: user.Id,
+		Text:     params.Body,
+		Id:       currentChirpId,
 	}
 
 	dat, err := json.Marshal(chirp)
@@ -188,6 +267,89 @@ func handlePostChirp(resp http.ResponseWriter, req *http.Request) {
 
 	initDb()
 	db = append(db, chirp)
+	saveDb()
+}
+
+func handleDeleteChirp(resp http.ResponseWriter, req *http.Request) {
+	chirpId, _ := strconv.Atoi(req.PathValue("chirpId"))
+
+	type returnVals struct {
+		Error       string `json:"error"`
+		Valid       bool   `json:"valid"`
+		CleanedBody string `json:"cleaned_body"`
+	}
+
+	jwtHeader := req.Header.Get("Authorization")
+	if jwtHeader == "" {
+		fmt.Println("Authorization header is not provided")
+		resp.WriteHeader(401)
+		return
+	}
+
+	jwtSecret := os.Getenv("JWT_SECRET")
+	jwtHeader = strings.TrimPrefix(jwtHeader, "Bearer ")
+
+	token, err := jwt.ParseWithClaims(jwtHeader, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(jwtSecret), nil
+	})
+
+	fmt.Println(jwtHeader)
+
+	if err != nil {
+		fmt.Printf("Could not parse token: %v %v\n", err, jwtHeader)
+		resp.WriteHeader(401)
+		return
+	}
+
+	claims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok || !token.Valid {
+		fmt.Println("Invalid token")
+		resp.WriteHeader(401)
+		return
+	}
+
+	if claims.ExpiresAt != nil && !claims.ExpiresAt.After(time.Now()) {
+		fmt.Println("Expired token")
+		resp.WriteHeader(401)
+		return
+	}
+
+	userId := claims.Subject
+	id, err := strconv.Atoi(userId)
+	if err != nil {
+		fmt.Println("Invalid user ID in token:", userId)
+		resp.WriteHeader(401)
+		return
+	}
+
+	user := findUserById(id)
+	if user == (User{}) {
+		respBody := returnVals{
+			Error: "User does not exist",
+		}
+
+		dat, err := json.Marshal(respBody)
+		if err != nil {
+			return
+		}
+		resp.Header().Set("Content-Type", "application/json")
+		resp.WriteHeader(500)
+		resp.Write(dat)
+		return
+	}
+
+	initDb()
+
+	status := 403
+	if deleteChirp(chirpId, user) {
+		status = 204
+	}
+
+	resp.WriteHeader(status)
+
 	saveDb()
 }
 
@@ -701,6 +863,7 @@ func main() {
 	})
 
 	serveMux.HandleFunc("POST /api/chirps", handlePostChirp)
+	serveMux.HandleFunc("DELETE /api/chirps/{chirpId}", handleDeleteChirp)
 	serveMux.HandleFunc("GET /api/chirps", handleGet)
 	serveMux.HandleFunc("GET /api/chirps/{chirpId}", handleGetWithParams)
 
