@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -43,11 +45,57 @@ type User struct {
 	Id       int    `json:"id"`
 	Email    string `json:"email"`
 	Password string `json:"password"`
-	Token    string `json:"token"`
+}
+
+type RefreshToken struct {
+	UserId    int       `json:"user_id"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 var db []Chirp = nil
 var userDb []User = nil
+var tokenDb []RefreshToken = nil
+
+func (s RefreshToken) isExpired() bool {
+	return s.ExpiresAt.After(time.Now())
+}
+
+func createRefreshToken(userId int) string {
+	randomKey := make([]byte, 256)
+	rand.Read(randomKey)
+
+	hexStr := hex.EncodeToString(randomKey)
+
+	tok := RefreshToken{
+		UserId:    userId,
+		Token:     hexStr,
+		ExpiresAt: time.Now(),
+	}
+	tokenDb = append(tokenDb, tok)
+	return hexStr
+}
+
+func getTokenFromDb(token string) RefreshToken {
+	for i := range len(tokenDb) {
+		if tokenDb[i].Token == token {
+			if tokenDb[i].isExpired() {
+				tokenDb = append(tokenDb[:i], tokenDb[i+1:]...)
+				return RefreshToken{}
+			}
+			return tokenDb[i]
+		}
+	}
+	return RefreshToken{}
+}
+
+func revokeToken(token string) {
+	for i := range len(tokenDb) {
+		if token == tokenDb[i].Token {
+			tokenDb = append(tokenDb[:i], tokenDb[i+1:]...)
+		}
+	}
+}
 
 func handleGet(resp http.ResponseWriter, req *http.Request) {
 	initDb()
@@ -379,8 +427,10 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	type returnVals struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
+		Id           int    `json:"id"`
+		Email        string `json:"email"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -407,33 +457,104 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
 
-	expireInSeconds := params.ExpiresInSeconds
-	if expireInSeconds == 0 || expireInSeconds > 24*60*60 {
-		expireInSeconds = 24 * 60 * 60
-	}
-
 	token := jwt.NewWithClaims(
 		jwt.SigningMethodHS256,
 		jwt.RegisteredClaims{
 			Issuer:    "chirpy",
 			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expireInSeconds) * time.Second).UTC()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(1) * time.Hour).UTC()),
 			Subject:   strconv.Itoa(user.Id),
 		},
 	)
 
 	signedToken, _ := token.SignedString(jwtSecret)
 
-	user.Token = signedToken
+	refresher := createRefreshToken(user.Id)
 
-	dat, err := json.Marshal(user)
+	fmt.Println(refresher)
+
+	respData := returnVals{
+		Id:           user.Id,
+		Email:        user.Email,
+		Token:        signedToken,
+		RefreshToken: refresher,
+	}
+
+	fmt.Println(respData)
+
+	reDat, err := json.Marshal(respData)
 	if err != nil {
 		return
 	}
 
 	resp.WriteHeader(200)
 	resp.Header().Set("Content-Type", "application/json")
-	resp.Write(dat)
+	resp.Write(reDat)
+}
+
+func handleRefresh(resp http.ResponseWriter, req *http.Request) {
+	type returnVals struct {
+		Token string `json:"token"`
+	}
+
+	refresher := req.Header.Get("Authorization")
+	if refresher == "" {
+		fmt.Println("Authorization header is not provided")
+		resp.WriteHeader(401)
+		return
+	}
+
+	refresher = strings.TrimPrefix(refresher, "Bearer ")
+
+	refreshToken := getTokenFromDb(refresher)
+
+	if refreshToken == (RefreshToken{}) {
+		fmt.Println("Token invalid")
+		resp.WriteHeader(401)
+		return
+	}
+
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+
+	token := jwt.NewWithClaims(
+		jwt.SigningMethodHS256,
+		jwt.RegisteredClaims{
+			Issuer:    "chirpy",
+			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(1) * time.Hour).UTC()),
+			Subject:   strconv.Itoa(refreshToken.UserId),
+		},
+	)
+
+	signedToken, _ := token.SignedString(jwtSecret)
+
+	respData := returnVals{
+		Token: signedToken,
+	}
+
+	reDat, err := json.Marshal(respData)
+	if err != nil {
+		return
+	}
+
+	resp.WriteHeader(200)
+	resp.Header().Set("Content-Type", "application/json")
+	resp.Write(reDat)
+}
+
+func handleRevoke(resp http.ResponseWriter, req *http.Request) {
+	refresher := req.Header.Get("Authorization")
+	if refresher == "" {
+		fmt.Println("Authorization header is not provided")
+		resp.WriteHeader(401)
+		return
+	}
+
+	refresher = strings.TrimPrefix(refresher, "Bearer ")
+
+	revokeToken(refresher)
+
+	resp.WriteHeader(204)
 }
 
 func initUserDb() {
@@ -586,6 +707,8 @@ func main() {
 	serveMux.HandleFunc("POST /api/users", handlePostUser)
 	serveMux.HandleFunc("PUT /api/users", handlePutUser)
 	serveMux.HandleFunc("POST /api/login", handleLogin)
+	serveMux.HandleFunc("POST /api/refresh", handleRefresh)
+	serveMux.HandleFunc("POST /api/revoke", handleRevoke)
 
 	serveMux.Handle("/*", http.StripPrefix("/app", cfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 
