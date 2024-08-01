@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,9 +44,10 @@ type Chirp struct {
 }
 
 type User struct {
-	Id       int    `json:"id"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Id          int    `json:"id"`
+	Email       string `json:"email"`
+	Password    string `json:"password"`
+	IsChirpyRed bool   `json:"is_chirpy_red"`
 }
 
 type RefreshToken struct {
@@ -98,12 +100,45 @@ func revokeToken(token string) {
 	}
 }
 
+type ById []Chirp
+
+func (a ById) Len() int           { return len(a) }
+func (a ById) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ById) Less(i, j int) bool { return a[i].Id < a[j].Id }
+
+type ByIdDesc []Chirp
+
+func (a ByIdDesc) Len() int           { return len(a) }
+func (a ByIdDesc) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByIdDesc) Less(i, j int) bool { return a[i].Id > a[j].Id }
+
 func handleGet(resp http.ResponseWriter, req *http.Request) {
 	initDb()
+
+	authId, err := strconv.Atoi(req.URL.Query().Get("author_id"))
+
+	chirps := []Chirp{}
+	if err != nil {
+		for _, ch := range db {
+			if ch.AuthorId == authId {
+				chirps = append(chirps, ch)
+			}
+		}
+	} else {
+		chirps = db
+	}
 
 	dat, err := json.Marshal(db)
 	if err != nil {
 		return
+	}
+
+	sortType := req.URL.Query().Get("sort")
+
+	if sortType == "asc" {
+		sort.Sort(ById(chirps))
+	} else {
+		sort.Sort(ByIdDesc(chirps))
 	}
 
 	resp.WriteHeader(200)
@@ -428,6 +463,64 @@ func handlePostUser(resp http.ResponseWriter, req *http.Request) {
 	saveUserDb()
 }
 
+func handlePostPolkaWebhook(resp http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserId int `json:"user_id"`
+		} `json:"data"`
+	}
+
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" {
+		fmt.Println("Authorization header is not provided")
+		resp.WriteHeader(401)
+		return
+	}
+
+	authHeader = strings.TrimPrefix(authHeader, "ApiKey ")
+
+	polkaApiKey := os.Getenv("POLKA_API_KEY")
+
+	if authHeader != polkaApiKey {
+		fmt.Println("Authorization header is not correct")
+		resp.WriteHeader(401)
+		return
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		fmt.Println("Ilformed body")
+		resp.WriteHeader(404)
+		return
+	}
+
+	if params.Event != "user.upgraded" {
+		fmt.Println("Unsupported event")
+		resp.WriteHeader(204)
+		return
+	}
+
+	fmt.Printf("Search by id: %v\n", params.Data.UserId)
+
+	found := findUserById(params.Data.UserId)
+	if found == (User{}) {
+		fmt.Println("User not found")
+		resp.WriteHeader(404)
+		return
+	}
+
+	initUserDb()
+
+	found.IsChirpyRed = true
+	updateUser(found)
+	resp.WriteHeader(204)
+
+	saveUserDb()
+}
+
 func handlePutUser(resp http.ResponseWriter, req *http.Request) {
 	fmt.Println("Put user")
 	type parameters struct {
@@ -554,6 +647,7 @@ func updateUser(user User) {
 		if userDb[i].Id == user.Id {
 			userDb[i].Email = user.Email
 			userDb[i].Password = user.Password
+			userDb[i].IsChirpyRed = user.IsChirpyRed
 			return
 		}
 	}
@@ -593,6 +687,7 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 		Email        string `json:"email"`
 		Token        string `json:"token"`
 		RefreshToken string `json:"refresh_token"`
+		IsChirpyRed  bool   `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -640,6 +735,7 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 		Email:        user.Email,
 		Token:        signedToken,
 		RefreshToken: refresher,
+		IsChirpyRed:  user.IsChirpyRed,
 	}
 
 	fmt.Println(respData)
@@ -872,6 +968,7 @@ func main() {
 	serveMux.HandleFunc("POST /api/login", handleLogin)
 	serveMux.HandleFunc("POST /api/refresh", handleRefresh)
 	serveMux.HandleFunc("POST /api/revoke", handleRevoke)
+	serveMux.HandleFunc("POST /api/polka/webhooks", handlePostPolkaWebhook)
 
 	serveMux.Handle("/*", http.StripPrefix("/app", cfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 
