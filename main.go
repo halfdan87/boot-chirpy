@@ -2,25 +2,31 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/halfdan87/boot-chirpy/internal/database"
 	"github.com/joho/godotenv"
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
+
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
 	fileserverHits int
 	jwtSecret      string
+	queries        *database.Queries
+	platform       string
 }
 
 func (conf *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -38,20 +44,24 @@ var currentChirpId int = 1
 var currentUserId int = 1
 
 type Chirp struct {
-	Id       int    `json:"id"`
-	Text     string `json:"body"`
-	AuthorId int    `json:"author_id"`
+	Id        string    `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Text      string    `json:"body"`
+	UserId    string    `json:"user_id"`
 }
 
 type User struct {
-	Id          int    `json:"id"`
-	Email       string `json:"email"`
-	Password    string `json:"password"`
-	IsChirpyRed bool   `json:"is_chirpy_red"`
+	Id          string    `json:"id"`
+	Email       string    `json:"email"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Password    string    `json:"password"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 type RefreshToken struct {
-	UserId    int       `json:"user_id"`
+	UserId    string    `json:"user_id"`
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
@@ -64,7 +74,7 @@ func (s RefreshToken) isExpired() bool {
 	return s.ExpiresAt.After(time.Now())
 }
 
-func createRefreshToken(userId int) string {
+func createRefreshToken(userId string) string {
 	randomKey := make([]byte, 256)
 	rand.Read(randomKey)
 
@@ -112,197 +122,170 @@ func (a ByIdDesc) Len() int           { return len(a) }
 func (a ByIdDesc) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByIdDesc) Less(i, j int) bool { return a[i].Id > a[j].Id }
 
-func handleGet(resp http.ResponseWriter, req *http.Request) {
-	initDb()
-
-	authId, err := strconv.Atoi(req.URL.Query().Get("author_id"))
-
-	chirps := []Chirp{}
-	if err != nil {
-		for _, ch := range db {
-			if ch.AuthorId == authId {
-				chirps = append(chirps, ch)
-			}
+func getHandleGetAllChirps(cfg *apiConfig) http.HandlerFunc {
+	return func(resp http.ResponseWriter, req *http.Request) {
+		chirps, err := cfg.queries.GetAllChirpsInAscendingOrder(req.Context())
+		if err != nil {
+			fmt.Println("Error getting all chirps: ", err)
+			resp.WriteHeader(500)
+			return
 		}
-	} else {
-		chirps = db
+
+		jsonChirps := []Chirp{}
+		for _, chirp := range chirps {
+			jsonChirps = append(jsonChirps, dbChirpToJson(chirp))
+		}
+
+		dat, err := json.Marshal(jsonChirps)
+		if err != nil {
+			return
+		}
+
+		resp.WriteHeader(200)
+		resp.Header().Set("Content-Type", "application/json")
+		resp.Write(dat)
 	}
-
-	dat, err := json.Marshal(db)
-	if err != nil {
-		return
-	}
-
-	sortType := req.URL.Query().Get("sort")
-
-	if sortType == "asc" {
-		sort.Sort(ById(chirps))
-	} else {
-		sort.Sort(ByIdDesc(chirps))
-	}
-
-	resp.WriteHeader(200)
-	resp.Header().Set("Content-Type", "application/json")
-	resp.Write(dat)
 }
 
 func deleteChirp(chirpId int, owner User) bool {
-	for i := range len(db) {
-		c := db[i]
-		if c.Id == chirpId {
-			if owner.Id != c.AuthorId {
-				return false
-			}
-			db = append(db[:i], db[i+1:]...)
-			return true
-		}
-	}
+	// handle in db
 	return false
 }
 
-func handleGetWithParams(resp http.ResponseWriter, req *http.Request) {
-	initDb()
+func getHandleGetWithParams(cfg *apiConfig) http.HandlerFunc {
+	return func(resp http.ResponseWriter, req *http.Request) {
+		chirpId := req.PathValue("chirpId")
 
-	chirpId, _ := strconv.Atoi(req.PathValue("chirpId"))
-
-	for _, chirp := range db {
-		if chirp.Id == chirpId {
-			dat, err := json.Marshal(chirp)
-			if err != nil {
-				return
-			}
-			resp.WriteHeader(200)
-			resp.Header().Set("Content-Type", "application/json")
-			resp.Write(dat)
+		parsedUUID, err := uuid.Parse(chirpId)
+		if err != nil {
+			fmt.Println("Error parsing chirp ID: ", err)
+			resp.WriteHeader(500)
 			return
 		}
-	}
+		dbChirp, err := cfg.queries.GetChirpByID(req.Context(), parsedUUID)
+		if err != nil {
+			fmt.Println("Error getting chirp by ID: ", err)
+			resp.WriteHeader(500)
+			return
+		}
 
-	resp.WriteHeader(404)
+		if dbChirp == (database.Chirp{}) {
+			resp.WriteHeader(404)
+			return
+		}
+
+		jsonChirp := dbChirpToJson(dbChirp)
+
+		dat, err := json.Marshal(jsonChirp)
+		if err != nil {
+			return
+		}
+		resp.WriteHeader(200)
+		resp.Header().Set("Content-Type", "application/json")
+		resp.Write(dat)
+		return
+	}
 }
 
-func handlePostChirp(resp http.ResponseWriter, req *http.Request) {
-	type parameters struct {
-		AuthorId int    `json:"author_id"`
-		Body     string `json:"body"`
-	}
-
-	type returnVals struct {
-		Error       string `json:"error"`
-		Valid       bool   `json:"valid"`
-		CleanedBody string `json:"cleaned_body"`
-	}
-
-	jwtHeader := req.Header.Get("Authorization")
-	if jwtHeader == "" {
-		fmt.Println("Authorization header is not provided")
-		resp.WriteHeader(401)
-		return
-	}
-
-	jwtSecret := os.Getenv("JWT_SECRET")
-	jwtHeader = strings.TrimPrefix(jwtHeader, "Bearer ")
-
-	token, err := jwt.ParseWithClaims(jwtHeader, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(jwtSecret), nil
-	})
-
-	fmt.Println(jwtHeader)
-
-	if err != nil {
-		fmt.Printf("Could not parse token: %v %v\n", err, jwtHeader)
-		resp.WriteHeader(401)
-		return
-	}
-
-	claims, ok := token.Claims.(*jwt.RegisteredClaims)
-	if !ok || !token.Valid {
-		fmt.Println("Invalid token")
-		resp.WriteHeader(401)
-		return
-	}
-
-	if claims.ExpiresAt != nil && !claims.ExpiresAt.After(time.Now()) {
-		fmt.Println("Expired token")
-		resp.WriteHeader(401)
-		return
-	}
-
-	userId := claims.Subject
-	id, err := strconv.Atoi(userId)
-	if err != nil {
-		fmt.Println("Invalid user ID in token:", userId)
-		resp.WriteHeader(401)
-		return
-	}
-
-	user := findUserById(id)
-	if user == (User{}) {
-		respBody := returnVals{
-			Error: "User does not exist",
+func getHandlePostChirp(cfg *apiConfig) http.HandlerFunc {
+	return func(resp http.ResponseWriter, req *http.Request) {
+		type parameters struct {
+			UserId string `json:"user_id"`
+			Body   string `json:"body"`
 		}
 
-		dat, err := json.Marshal(respBody)
+		/*
+			jwtHeader := req.Header.Get("Authorization")
+			if jwtHeader == "" {
+				fmt.Println("Authorization header is not provided")
+				resp.WriteHeader(401)
+				return
+			}
+
+			jwtSecret := cfg.jwtSecret
+			jwtHeader = strings.TrimPrefix(jwtHeader, "Bearer ")
+
+			token, err := jwt.ParseWithClaims(jwtHeader, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+				}
+				return []byte(jwtSecret), nil
+			})
+
+			fmt.Println(jwtHeader)
+
+			if err != nil {
+				fmt.Printf("Could not parse token: %v %v\n", err, jwtHeader)
+				resp.WriteHeader(401)
+				return
+			}
+
+			claims, ok := token.Claims.(*jwt.RegisteredClaims)
+			if !ok || !token.Valid {
+				fmt.Println("Invalid token")
+				resp.WriteHeader(401)
+				return
+			}
+
+			if claims.ExpiresAt != nil && !claims.ExpiresAt.After(time.Now()) {
+				fmt.Println("Expired token")
+				resp.WriteHeader(401)
+				return
+			}
+
+			userId := claims.Subject
+			id, err := strconv.Atoi(userId)
+			if err != nil {
+				fmt.Println("Invalid user ID in token:", userId)
+				resp.WriteHeader(401)
+				return
+			}
+
+		*/
+
+		decoder := json.NewDecoder(req.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			resp.WriteHeader(500)
+			return
+		}
+
+		status := 201
+		if len(params.Body) > 140 {
+			status = 400
+		}
+
+		userUUID, err := uuid.Parse(params.UserId)
+		if err != nil {
+			fmt.Println("Error parsing user ID: ", err)
+			resp.WriteHeader(500)
+			return
+		}
+
+		purified := purify(params.Body)
+		createParams := database.CreateChirpParams{
+			UserID: userUUID,
+			Body:   purified,
+		}
+		dbChirp, err := cfg.queries.CreateChirp(req.Context(), createParams)
+		if err != nil {
+			fmt.Println("Error creating chirp: ", err)
+			resp.WriteHeader(500)
+			return
+		}
+
+		chirp := dbChirpToJson(dbChirp)
+
+		dat, err := json.Marshal(chirp)
 		if err != nil {
 			return
 		}
+
+		resp.WriteHeader(status)
 		resp.Header().Set("Content-Type", "application/json")
-		resp.WriteHeader(500)
 		resp.Write(dat)
-		return
 	}
-
-	decoder := json.NewDecoder(req.Body)
-	params := parameters{}
-	err = decoder.Decode(&params)
-	if err != nil {
-		respBody := returnVals{
-			Error: "Error decoding json",
-		}
-
-		dat, err := json.Marshal(respBody)
-		if err != nil {
-			return
-		}
-		resp.Header().Set("Content-Type", "application/json")
-		resp.WriteHeader(500)
-		resp.Write(dat)
-		return
-	}
-
-	status := 201
-	if len(params.Body) > 140 {
-		status = 400
-	}
-
-	chirp := Chirp{
-		AuthorId: user.Id,
-		Text:     params.Body,
-		Id:       currentChirpId,
-	}
-
-	dat, err := json.Marshal(chirp)
-	if err != nil {
-		return
-	}
-
-	purified := purify(params.Body)
-
-	chirp.Text = purified
-
-	resp.WriteHeader(status)
-	resp.Header().Set("Content-Type", "application/json")
-	resp.Write(dat)
-
-	// Save file
-	currentChirpId++
-
-	initDb()
-	db = append(db, chirp)
-	saveDb()
 }
 
 func handleDeleteChirp(resp http.ResponseWriter, req *http.Request) {
@@ -388,79 +371,56 @@ func handleDeleteChirp(resp http.ResponseWriter, req *http.Request) {
 	saveDb()
 }
 
-func handlePostUser(resp http.ResponseWriter, req *http.Request) {
-	type parameters struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
-	}
-
-	type returnVals struct {
-		Error       string `json:"error"`
-		Valid       bool   `json:"valid"`
-		CleanedBody string `json:"cleaned_body"`
-	}
-
-	decoder := json.NewDecoder(req.Body)
-	params := parameters{}
-	err := decoder.Decode(&params)
-	if err != nil {
-		respBody := returnVals{
-			Error: "Error decoding json",
+func getHandlePostUser(cfg *apiConfig) http.HandlerFunc {
+	return func(resp http.ResponseWriter, req *http.Request) {
+		type parameters struct {
+			Password string `json:"password"`
+			Email    string `json:"email"`
 		}
 
-		dat, err := json.Marshal(respBody)
+		type returnVals struct {
+			Error       string `json:"error"`
+			Valid       bool   `json:"valid"`
+			CleanedBody string `json:"cleaned_body"`
+		}
+
+		decoder := json.NewDecoder(req.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			respBody := returnVals{
+				Error: "Error decoding json",
+			}
+
+			dat, err := json.Marshal(respBody)
+			if err != nil {
+				return
+			}
+			resp.Header().Set("Content-Type", "application/json")
+			resp.WriteHeader(500)
+			resp.Write(dat)
+			return
+		}
+
+		user, err := cfg.queries.CreateUser(req.Context(), params.Email)
+		if err != nil {
+			fmt.Println("Error creating user: ", err)
+			resp.WriteHeader(500)
+			return
+		}
+
+		status := 201
+
+		jsonUser := dbUserToJson(user)
+		dat, err := json.Marshal(jsonUser)
 		if err != nil {
 			return
 		}
+
+		resp.WriteHeader(status)
 		resp.Header().Set("Content-Type", "application/json")
-		resp.WriteHeader(500)
 		resp.Write(dat)
-		return
 	}
-
-	if found := findUserByEmail(params.Email); found != (User{}) {
-		respBody := returnVals{
-			Error: fmt.Sprintf("User by email %s already exists", params.Email),
-		}
-
-		dat, err := json.Marshal(respBody)
-		if err != nil {
-			return
-		}
-		resp.Header().Set("Content-Type", "application/json")
-		resp.WriteHeader(500)
-		resp.Write(dat)
-		return
-	} else {
-		fmt.Println("FOund:", found)
-	}
-
-	status := 201
-
-	user := User{
-		Id:    currentUserId,
-		Email: params.Email,
-	}
-
-	currentUserId++
-
-	dat, err := json.Marshal(user)
-	if err != nil {
-		return
-	}
-
-	resp.WriteHeader(status)
-	resp.Header().Set("Content-Type", "application/json")
-	resp.Write(dat)
-
-	// Save file
-
-	cryptedPassword, _ := bcrypt.GenerateFromPassword([]byte(params.Password), bcrypt.DefaultCost)
-	user.Password = string(cryptedPassword)
-
-	initUserDb()
-	userDb = append(userDb, user)
-	saveUserDb()
 }
 
 func handlePostPolkaWebhook(resp http.ResponseWriter, req *http.Request) {
@@ -665,13 +625,7 @@ func findUserByEmail(email string) User {
 }
 
 func findUserById(id int) User {
-	initUserDb()
-
-	for _, user := range userDb {
-		if user.Id == id {
-			return user
-		}
-	}
+	// TODO: This should be done in the database
 	return User{}
 }
 
@@ -683,7 +637,7 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	type returnVals struct {
-		Id           int    `json:"id"`
+		Id           string `json:"id"`
 		Email        string `json:"email"`
 		Token        string `json:"token"`
 		RefreshToken string `json:"refresh_token"`
@@ -720,7 +674,7 @@ func handleLogin(resp http.ResponseWriter, req *http.Request) {
 			Issuer:    "chirpy",
 			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(1) * time.Hour).UTC()),
-			Subject:   strconv.Itoa(user.Id),
+			Subject:   user.Id,
 		},
 	)
 
@@ -780,7 +734,7 @@ func handleRefresh(resp http.ResponseWriter, req *http.Request) {
 			Issuer:    "chirpy",
 			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(1) * time.Hour).UTC()),
-			Subject:   strconv.Itoa(refreshToken.UserId),
+			Subject:   refreshToken.UserId,
 		},
 	)
 
@@ -928,6 +882,25 @@ func main() {
 	jwtSecret := os.Getenv("JWT_SECRET")
 	cfg.jwtSecret = jwtSecret
 
+	dbUrl := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbUrl)
+	if err != nil {
+		fmt.Println("Error connecting to database: ", err)
+		return
+	}
+	defer db.Close()
+
+	err = db.Ping()
+	if err != nil {
+		fmt.Println("Error pinging database: ", err)
+		return
+	}
+
+	cfg.queries = database.New(db)
+
+	platform := os.Getenv("PLATFORM")
+	cfg.platform = platform
+
 	serveMux.HandleFunc("GET /api/healthz", func(resp http.ResponseWriter, req *http.Request) {
 		resp.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
 		resp.WriteHeader(200)
@@ -938,7 +911,19 @@ func main() {
 		resp.WriteHeader(405)
 	})
 
-	serveMux.HandleFunc("/api/reset", func(resp http.ResponseWriter, req *http.Request) {
+	serveMux.HandleFunc("/admin/reset", func(resp http.ResponseWriter, req *http.Request) {
+		if cfg.platform != "dev" {
+			resp.WriteHeader(403)
+			return
+		}
+
+		err := cfg.queries.DeleteAllUsers(req.Context())
+		if err != nil {
+			fmt.Println("Error deleting all users: ", err)
+			resp.WriteHeader(500)
+			return
+		}
+
 		cfg.reset()
 		resp.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
 		resp.WriteHeader(200)
@@ -958,12 +943,12 @@ func main() {
         `, cfg.fileserverHits)))
 	})
 
-	serveMux.HandleFunc("POST /api/chirps", handlePostChirp)
+	serveMux.HandleFunc("POST /api/chirps", getHandlePostChirp(&cfg))
 	serveMux.HandleFunc("DELETE /api/chirps/{chirpId}", handleDeleteChirp)
-	serveMux.HandleFunc("GET /api/chirps", handleGet)
-	serveMux.HandleFunc("GET /api/chirps/{chirpId}", handleGetWithParams)
+	serveMux.HandleFunc("GET /api/chirps", getHandleGetAllChirps(&cfg))
+	serveMux.HandleFunc("GET /api/chirps/{chirpId}", getHandleGetWithParams(&cfg))
 
-	serveMux.HandleFunc("POST /api/users", handlePostUser)
+	serveMux.HandleFunc("POST /api/users", getHandlePostUser(&cfg))
 	serveMux.HandleFunc("PUT /api/users", handlePutUser)
 	serveMux.HandleFunc("POST /api/login", handleLogin)
 	serveMux.HandleFunc("POST /api/refresh", handleRefresh)
@@ -976,11 +961,32 @@ func main() {
 		Addr:    "0.0.0.0:8080",
 		Handler: serveMux,
 	}
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 
 	if err != nil {
 		fmt.Println("Error: ", err)
 	}
 
 	fmt.Println("Hello, world!")
+}
+
+func dbUserToJson(user database.User) User {
+	return User{
+		Id:          user.ID.String(),
+		Email:       user.Email,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Password:    "",
+		IsChirpyRed: false,
+	}
+}
+
+func dbChirpToJson(chirp database.Chirp) Chirp {
+	return Chirp{
+		Id:        chirp.ID.String(),
+		Text:      chirp.Body,
+		UserId:    chirp.UserID.String(),
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+	}
 }
